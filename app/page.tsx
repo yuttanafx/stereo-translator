@@ -15,29 +15,27 @@ const LANG_VOICE_PREFIX: Record<string, string> = {
   th: 'th', en: 'en', ja: 'ja', zh: 'zh', ko: 'ko', fr: 'fr', es: 'es',
 }
 
+type Turn = { who: 'A' | 'B'; fromLang: string; toLang: string; original: string; translated: string }
+
 export default function Home() {
   const [geminiKey, setGeminiKey]       = useState('')
-  const [srcLang, setSrcLang]           = useState('en')
-  const [tgtLang, setTgtLang]           = useState('th')
+  const [langA, setLangA]               = useState('en')   // person A's language → spoken out LEFT
+  const [langB, setLangB]               = useState('th')   // person B's language → spoken out RIGHT
   const [voices, setVoices]             = useState<SpeechSynthesisVoice[]>([])
-  const [voiceSrc, setVoiceSrc]         = useState('')
-  const [voiceTgt, setVoiceTgt]         = useState('')
-  const [playMode, setPlayMode]         = useState<'sequential'|'simultaneous'>('sequential')
-  const [srcText, setSrcText]           = useState('')
-  const [tgtText, setTgtText]           = useState('')
+  const [voiceA, setVoiceA]             = useState('')
+  const [voiceB, setVoiceB]             = useState('')
+  const [activeSpeaker, setActiveSpeaker] = useState<'A' | 'B' | null>(null) // who is currently being listened to
+  const [phase, setPhase]               = useState<'idle'|'listening'|'translating'|'speaking'>('idle')
   const [status, setStatus]             = useState('')
   const [statusType, setStatusType]     = useState('')
-  const [isRecording, setIsRecording]   = useState(false)
-  const [isPlaying, setIsPlaying]       = useState(false)
-  const [ready, setReady]               = useState(false)
+  const [history, setHistory]           = useState<Turn[]>([])
   const [barL, setBarL]                 = useState(0)
   const [barR, setBarR]                 = useState(0)
-  const [micHint, setMicHint]           = useState('กดเพื่อเริ่มพูด')
 
   const recognitionRef  = useRef<any>(null)
   const vizRef          = useRef<ReturnType<typeof setInterval> | null>(null)
-  const currentSrcRef   = useRef('')
-  const currentTgtRef   = useRef('')
+  const activeSpeakerRef = useRef<'A' | 'B' | null>(null) // mirrors state for use inside async callbacks
+  const phaseRef         = useRef<'idle'|'listening'|'translating'|'speaking'>('idle')
 
   useEffect(() => {
     const gem = localStorage.getItem('gemini_key') || ''
@@ -50,11 +48,10 @@ export default function Home() {
       const list: SpeechSynthesisVoice[] = synth.getVoices()
       if (!list.length) return
       setVoices(list)
-      // pick saved choice, else best-matching voice for current languages
-      const savedSrc = localStorage.getItem('voice_src') || ''
-      const savedTgt = localStorage.getItem('voice_tgt') || ''
-      setVoiceSrc(savedSrc && list.some(v => v.name === savedSrc) ? savedSrc : pickVoiceFor(srcLang, list))
-      setVoiceTgt(savedTgt && list.some(v => v.name === savedTgt) ? savedTgt : pickVoiceFor(tgtLang, list))
+      const savedA = localStorage.getItem('voice_a') || ''
+      const savedB = localStorage.getItem('voice_b') || ''
+      setVoiceA(savedA && list.some(v => v.name === savedA) ? savedA : pickVoiceFor(langA, list))
+      setVoiceB(savedB && list.some(v => v.name === savedB) ? savedB : pickVoiceFor(langB, list))
     }
     loadVoices()
     synth.onvoiceschanged = loadVoices
@@ -68,23 +65,22 @@ export default function Home() {
     return match ? match.name : (list[0]?.name || '')
   }
 
-  // When source/target language changes, re-pick a sensible default voice if available
   useEffect(() => {
     if (!voices.length) return
-    setVoiceSrc(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[srcLang] || srcLang))) ? prev : pickVoiceFor(srcLang, voices))
+    setVoiceA(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[langA] || langA))) ? prev : pickVoiceFor(langA, voices))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [srcLang, voices])
+  }, [langA, voices])
 
   useEffect(() => {
     if (!voices.length) return
-    setVoiceTgt(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[tgtLang] || tgtLang))) ? prev : pickVoiceFor(tgtLang, voices))
+    setVoiceB(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[langB] || langB))) ? prev : pickVoiceFor(langB, voices))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tgtLang, voices])
+  }, [langB, voices])
 
   function saveKeys() {
     localStorage.setItem('gemini_key', geminiKey)
-    localStorage.setItem('voice_src', voiceSrc)
-    localStorage.setItem('voice_tgt', voiceTgt)
+    localStorage.setItem('voice_a', voiceA)
+    localStorage.setItem('voice_b', voiceB)
     showStatus('✓ บันทึก API Key แล้ว', 'done')
     setTimeout(() => showStatus(''), 2000)
   }
@@ -93,60 +89,79 @@ export default function Home() {
     setStatus(msg); setStatusType(type)
   }
 
-  function swapLangs() {
-    setSrcLang(tgtLang); setTgtLang(srcLang)
+  function setPhaseBoth(p: 'idle'|'listening'|'translating'|'speaking') {
+    phaseRef.current = p
+    setPhase(p)
   }
 
-  // ── Mic ──────────────────────────────────────────────────────────────────
-  function toggleMic() {
-    if (isRecording) stopMic()
-    else startMic()
-  }
-
-  function startMic() {
+  // ── Press-to-speak: tap A or B before speaking ──────────────────────────────
+  function pressSpeaker(who: 'A' | 'B') {
+    if (phaseRef.current !== 'idle') {
+      // currently busy (listening/translating/speaking) — pressing again cancels
+      stopListening()
+      return
+    }
     if (!geminiKey) { showStatus('⚠ ใส่ Gemini API Key ก่อน', 'error'); return }
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
     if (!SR) { showStatus('⚠ Browser ไม่รองรับ Speech Recognition', 'error'); return }
 
+    const lang = who === 'A' ? langA : langB
     const rec = new SR()
-    rec.lang = LANG_STT[srcLang] || 'en-US'
+    rec.lang = LANG_STT[lang] || 'en-US'
     rec.interimResults = true
     rec.continuous = false
     recognitionRef.current = rec
+    activeSpeakerRef.current = who
+    setActiveSpeaker(who)
 
     rec.onstart = () => {
-      setIsRecording(true)
-      setMicHint('กำลังฟัง… พูดได้เลย')
-      showStatus('🎙 รับเสียง…', 'active')
-      setReady(false)
-      setSrcText(''); setTgtText('')
-      currentSrcRef.current = ''; currentTgtRef.current = ''
+      setPhaseBoth('listening')
+      showStatus(who === 'A' ? '🎙 A กำลังพูด…' : '🎙 B กำลังพูด…', 'active')
+      startViz(who === 'A', who === 'B')
     }
     rec.onresult = (e: any) => {
-      let final = '', interim = ''
+      let final = ''
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) final += e.results[i][0].transcript
-        else interim += e.results[i][0].transcript
       }
-      setSrcText(final || interim)
-      if (final) { currentSrcRef.current = final; doTranslate(final) }
+      if (final) handleFinalTranscript(who, final.trim())
     }
-    rec.onerror = (e: any) => { showStatus('⚠ ' + e.error, 'error'); stopMic() }
-    rec.onend = () => stopMic()
+    rec.onerror = (e: any) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') { resetIdle(); return }
+      showStatus('⚠ ' + e.error, 'error')
+      resetIdle()
+    }
+    rec.onend = () => {
+      // if recognition ended without producing a final transcript, go back to idle
+      if (activeSpeakerRef.current && phaseRef.current === 'listening') resetIdle()
+    }
     rec.start()
   }
 
-  function stopMic() {
-    setIsRecording(false)
-    setMicHint('กดเพื่อเริ่มพูด')
+  function stopListening() {
     try { recognitionRef.current?.stop() } catch {}
+    resetIdle()
   }
 
-  // ── Translate (Gemini 2.5 Flash) ────────────────────────────────────────────
-  async function doTranslate(text: string) {
-    showStatus('🔄 กำลังแปลด้วย Gemini…', 'active')
-    const srcName = LANG_NAMES[srcLang] || 'English'
-    const tgtName = LANG_NAMES[tgtLang] || 'Thai'
+  function resetIdle() {
+    stopViz()
+    setPhaseBoth('idle')
+    setActiveSpeaker(null)
+    activeSpeakerRef.current = null
+    showStatus('')
+  }
+
+  // ── Translate (Gemini 2.5 Flash) then speak the translation only ───────────
+  async function handleFinalTranscript(who: 'A' | 'B', text: string) {
+    setPhaseBoth('translating')
+    stopViz()
+    showStatus('🔄 กำลังแปล…', 'active')
+
+    const fromLang = who === 'A' ? langA : langB
+    const toLang   = who === 'A' ? langB : langA
+    const fromName = LANG_NAMES[fromLang] || fromLang
+    const toName    = LANG_NAMES[toLang] || toLang
+
     try {
       const resp = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
@@ -159,7 +174,7 @@ export default function Home() {
           body: JSON.stringify({
             contents: [{
               role: 'user',
-              parts: [{ text: `Translate from ${srcName} to ${tgtName}. Return ONLY the translated text, nothing else.\n\n${text}` }],
+              parts: [{ text: `Translate from ${fromName} to ${toName}. Return ONLY the translated text, nothing else.\n\n${text}` }],
             }],
           }),
         }
@@ -171,12 +186,22 @@ export default function Home() {
       const data = await resp.json()
       const translated = (data.candidates?.[0]?.content?.parts?.[0]?.text || '').trim()
       if (!translated) throw new Error('ไม่ได้รับคำแปลจาก Gemini')
-      currentTgtRef.current = translated
-      setTgtText(translated)
-      showStatus('✓ พร้อมแล้ว! กด ▶ เพื่อฟัง', 'done')
-      setReady(true)
+
+      setHistory(h => [...h, { who, fromLang, toLang, original: text, translated }])
+
+      // speak the translation out the listener's ear: A speaks → B hears on the
+      // language-B side (right), B speaks → A hears on the language-A side (left)
+      setPhaseBoth('speaking')
+      const outVoice = who === 'A' ? voiceB : voiceA
+      const outLang  = toLang
+      showStatus(who === 'A' ? '▶ หูขวา — คำแปลถึง B' : '◀ หูซ้าย — คำแปลถึง A', 'active')
+      startViz(who === 'B', who === 'A') // output ear is the OTHER person's side
+      await speak(translated, outVoice, outLang)
+      stopViz()
+      resetIdle()
     } catch (err: any) {
       showStatus('⚠ ' + err.message, 'error')
+      resetIdle()
     }
   }
 
@@ -191,12 +216,13 @@ export default function Home() {
       utter.lang = v?.lang || LANG_STT[lang] || 'en-US'
       utter.onend = () => resolve()
       utter.onerror = (e: any) => reject(new Error(e?.error || 'พูดไม่สำเร็จ'))
-      synth.cancel() // clear any queued utterances first
+      synth.cancel()
       synth.speak(utter)
     })
   }
 
   function startViz(l: boolean, r: boolean) {
+    if (vizRef.current) clearInterval(vizRef.current)
     let lv = 0, rv = 0, ld = 1, rd = 1
     vizRef.current = setInterval(() => {
       if (l) { lv = Math.max(10, Math.min(92, lv + ld * (Math.random() * 14))); if (lv > 88 || lv < 12) ld *= -1 }
@@ -210,47 +236,14 @@ export default function Home() {
     setBarL(0); setBarR(0)
   }
 
-  async function playStereo() {
-    const src = currentSrcRef.current, tgt = currentTgtRef.current
-    if (!src || !tgt) return
-    setIsPlaying(true)
-    try {
-      if (playMode === 'sequential') {
-        showStatus('◀ หูซ้าย — เสียงต้นทาง', 'active')
-        startViz(true, false)
-        await speak(src, voiceSrc, srcLang)
-        stopViz()
-        await sleep(400)
-        showStatus('▶ หูขวา — เสียงแปล', 'active')
-        startViz(false, true)
-        await speak(tgt, voiceTgt, tgtLang)
-        stopViz()
-      } else {
-        // Web Speech API can only speak one utterance at a time per the
-        // browser's synthesis queue, so "simultaneous" plays back-to-back
-        // with both visualizer bars active to suggest the stereo pairing.
-        showStatus('⊕ ทั้งสองหู (เล่นต่อกันเร็ว)', 'active')
-        startViz(true, true)
-        await speak(src, voiceSrc, srcLang)
-        await speak(tgt, voiceTgt, tgtLang)
-        stopViz()
-      }
-      showStatus('✓ เล่นเสร็จแล้ว 🎧', 'done')
-    } catch (err: any) {
-      stopViz(); showStatus('⚠ ' + err.message, 'error')
-    } finally {
-      setIsPlaying(false)
-    }
-  }
-
-  function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
-
   // group voices by language prefix match, fall back to showing all
   function voicesFor(lang: string) {
     const prefix = LANG_VOICE_PREFIX[lang] || lang
     const matched = voices.filter(v => v.lang.toLowerCase().startsWith(prefix))
     return matched.length ? matched : voices
   }
+
+  const busy = phase !== 'idle'
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -268,11 +261,10 @@ export default function Home() {
 
         {/* Header */}
         <div style={{ textAlign:'center', marginBottom:20 }}>
-          <div style={{ fontSize:11, letterSpacing:4, color:'var(--muted)', textTransform:'uppercase', marginBottom:6 }}>True Stereo</div>
+          <div style={{ fontSize:11, letterSpacing:4, color:'var(--muted)', textTransform:'uppercase', marginBottom:6 }}>Live Conversation</div>
           <h1 style={{ fontSize:24, fontWeight:700 }}>🎧 Stereo Translator</h1>
-          <div style={{ display:'flex', gap:10, justifyContent:'center', marginTop:8 }}>
-            <span style={{ fontSize:11, fontWeight:600, letterSpacing:1.5, padding:'3px 12px', borderRadius:20, background:'var(--left-dim)', color:'var(--left)', textTransform:'uppercase' }}>◀ L · ต้นทาง</span>
-            <span style={{ fontSize:11, fontWeight:600, letterSpacing:1.5, padding:'3px 12px', borderRadius:20, background:'var(--right-dim)', color:'var(--right)', textTransform:'uppercase' }}>R ▶ · แปลแล้ว</span>
+          <div style={{ fontSize:12, color:'var(--muted)', marginTop:8, lineHeight:1.6 }}>
+            กดปุ่มของคนที่จะพูดก่อนพูดทุกครั้ง พูดจบ ระบบแปล+พูดออกอัตโนมัติ
           </div>
         </div>
 
@@ -290,36 +282,21 @@ export default function Home() {
           <button onClick={saveKeys} style={{ marginTop:4, background:'var(--left-dim)', border:'1px solid var(--left)', color:'var(--left)', borderRadius:8, padding:'8px 16px', fontFamily:"'Space Grotesk',sans-serif", fontSize:12, fontWeight:600, cursor:'pointer' }}>💾 บันทึก Key</button>
         </div>
 
-        {/* Mode toggle */}
-        <div style={{ display:'flex', gap:6, width:'100%', maxWidth:480, marginBottom:12 }}>
-          {(['sequential','simultaneous'] as const).map(m => (
-            <button key={m} onClick={() => setPlayMode(m)}
-              style={{ flex:1, padding:'8px', borderRadius:8, border:'1px solid', borderColor: playMode===m ? 'var(--left)' : 'var(--border)', background: playMode===m ? 'var(--left-dim)' : 'transparent', color: playMode===m ? 'var(--left)' : 'var(--muted)', fontFamily:"'Space Grotesk',sans-serif", fontSize:11, fontWeight:600, cursor:'pointer' }}>
-              {m === 'sequential' ? '▶▶ เล่นต่อกัน' : '⊕ เล่นต่อกันเร็ว'}
-            </button>
+        {/* Language selector for A / B */}
+        <div style={{ display:'flex', gap:8, width:'100%', maxWidth:480, marginBottom:12 }}>
+          {[['A', langA, setLangA, 'var(--left)'],['B', langB, setLangB, 'var(--right)']].map(([label, val, setter, color]: any) => (
+            <div key={label} style={{ flex:1, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:10, padding:'8px 12px' }}>
+              <label style={{ fontSize:10, letterSpacing:1.5, color, textTransform:'uppercase', display:'block', marginBottom:4 }}>คน {label} พูดภาษา</label>
+              <select value={val} onChange={e => setter(e.target.value)} style={{ background:'transparent', border:'none', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:13.5, fontWeight:600, outline:'none', cursor:'pointer', width:'100%' }}>
+                {Object.entries(LANG_NAMES).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+              </select>
+            </div>
           ))}
         </div>
 
-        {/* Language selector */}
-        <div style={{ display:'flex', alignItems:'center', gap:10, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'12px 16px', width:'100%', maxWidth:480, marginBottom:12 }}>
-          <div style={{ flex:1 }}>
-            <label style={{ fontSize:10, letterSpacing:1.5, color:'var(--muted)', textTransform:'uppercase', display:'block', marginBottom:3 }}>ต้นทาง (หูซ้าย)</label>
-            <select value={srcLang} onChange={e => setSrcLang(e.target.value)} style={{ background:'transparent', border:'none', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:14, fontWeight:600, outline:'none', cursor:'pointer', width:'100%' }}>
-              {Object.entries(LANG_NAMES).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
-            </select>
-          </div>
-          <button onClick={swapLangs} style={{ background:'var(--border)', border:'none', color:'var(--muted)', width:34, height:34, borderRadius:'50%', cursor:'pointer', fontSize:15, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>⇄</button>
-          <div style={{ flex:1, textAlign:'right' }}>
-            <label style={{ fontSize:10, letterSpacing:1.5, color:'var(--muted)', textTransform:'uppercase', display:'block', marginBottom:3 }}>เป้าหมาย (หูขวา)</label>
-            <select value={tgtLang} onChange={e => setTgtLang(e.target.value)} style={{ background:'transparent', border:'none', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:14, fontWeight:600, outline:'none', cursor:'pointer', width:'100%', textAlign:'right' }}>
-              {Object.entries(LANG_NAMES).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
-            </select>
-          </div>
-        </div>
-
-        {/* Voice pickers (system voices via Web Speech API) */}
+        {/* Voice pickers */}
         <div style={{ display:'flex', gap:8, width:'100%', maxWidth:480, marginBottom:6 }}>
-          {[['◀ L เสียงต้นทาง', voiceSrc, setVoiceSrc, 'var(--left)', srcLang],['R ▶ เสียงแปล', voiceTgt, setVoiceTgt, 'var(--right)', tgtLang]].map(([label, val, setter, color, lang]: any) => (
+          {[['◀ เสียง A', voiceA, setVoiceA, 'var(--left)', langA],['เสียง B ▶', voiceB, setVoiceB, 'var(--right)', langB]].map(([label, val, setter, color, lang]: any) => (
             <div key={label} style={{ flex:1, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:10, padding:'8px 12px' }}>
               <label style={{ fontSize:10, letterSpacing:1.5, color, textTransform:'uppercase', display:'block', marginBottom:4 }}>{label}</label>
               {voicesFor(lang).length ? (
@@ -332,62 +309,84 @@ export default function Home() {
             </div>
           ))}
         </div>
-        <div style={{ fontSize:10, color:'var(--muted)', textAlign:'center', marginBottom:12, lineHeight:1.5 }}>
+        <div style={{ fontSize:10, color:'var(--muted)', textAlign:'center', marginBottom:18, lineHeight:1.5 }}>
           เสียงมาจากระบบ/เบราว์เซอร์ของคุณ — รายการอาจต่างกันในแต่ละเครื่อง
         </div>
 
-        {/* Mic */}
-        <div style={{ position:'relative', margin:'8px 0 10px', display:'flex', alignItems:'center', justifyContent:'center' }}>
-          <button onClick={toggleMic}
-            style={{ width:76, height:76, borderRadius:'50%', border:`2px solid ${isRecording ? 'var(--left)' : 'var(--border)'}`, background: isRecording ? 'var(--left-dim)' : 'var(--surface)', color:'var(--text)', fontSize:26, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center', position:'relative', zIndex:1, transition:'all 0.2s' }}>
-            {isRecording ? '⏹' : '🎙️'}
-          </button>
-          {isRecording && (
-            <div style={{ position:'absolute', inset:-14, borderRadius:'50%', border:'2px solid var(--left)', opacity:0.5, animation:'pulse 1.4s ease-out infinite' }} />
-          )}
+        {/* Press-to-speak buttons */}
+        <div style={{ display:'flex', gap:14, width:'100%', maxWidth:480, marginBottom:16, justifyContent:'center' }}>
+          {(['A','B'] as const).map(who => {
+            const color = who === 'A' ? 'var(--left)' : 'var(--right)'
+            const dim   = who === 'A' ? 'var(--left-dim)' : 'var(--right-dim)'
+            const thisActive = activeSpeaker === who
+            const disabled = busy && !thisActive
+            return (
+              <div key={who} style={{ position:'relative', flex:1, display:'flex', flexDirection:'column', alignItems:'center' }}>
+                <button onClick={() => pressSpeaker(who)} disabled={disabled}
+                  style={{
+                    width:'100%', aspectRatio:'1', maxWidth:130, borderRadius:'50%',
+                    border:`2px solid ${thisActive ? color : 'var(--border)'}`,
+                    background: thisActive ? dim : 'var(--surface)',
+                    color: disabled ? 'var(--muted)' : 'var(--text)',
+                    fontSize:15, fontWeight:700, cursor: disabled ? 'default' : 'pointer',
+                    opacity: disabled ? 0.4 : 1,
+                    display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:4,
+                    position:'relative', zIndex:1, transition:'all 0.2s',
+                  }}>
+                  <span style={{ fontSize:24 }}>{thisActive && phase === 'listening' ? '⏹' : '🎙️'}</span>
+                  <span>{who}</span>
+                </button>
+                {thisActive && phase === 'listening' && (
+                  <div style={{ position:'absolute', top:0, width:'100%', maxWidth:130, aspectRatio:'1', borderRadius:'50%', border:`2px solid ${color}`, opacity:0.5, animation:'pulse 1.4s ease-out infinite' }} />
+                )}
+                <div style={{ fontSize:11, color:'var(--muted)', marginTop:8, textAlign:'center' }}>
+                  {LANG_NAMES[who === 'A' ? langA : langB]}
+                </div>
+              </div>
+            )
+          })}
         </div>
-        <div style={{ fontSize:12, color:'var(--muted)', marginBottom:10, textAlign:'center' }}>{micHint}</div>
-        <div style={{ fontSize:12, color: statusType==='error' ? 'var(--right)' : statusType==='done' ? '#4fff8f' : statusType==='active' ? 'var(--left)' : 'var(--muted)', marginBottom:12, height:16, textAlign:'center' }}>{status}</div>
 
-        {/* Text panels */}
-        <div style={{ display:'flex', gap:10, width:'100%', maxWidth:480, marginBottom:12 }}>
-          {[['left','ต้นทาง', srcText,'var(--left)'],['right','แปลแล้ว', tgtText,'var(--right)']].map(([side, label, text, color]: any) => (
-            <div key={side} style={{ flex:1, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:12, padding:12, minHeight:90 }}>
-              <div style={{ fontSize:10, fontWeight:600, letterSpacing:2, textTransform:'uppercase', color, display:'flex', alignItems:'center', gap:5, marginBottom:5 }}>
-                <span style={{ width:6, height:6, borderRadius:'50%', background:color, display:'inline-block' }} />{label}
-              </div>
-              <div style={{ fontSize:13, lineHeight:1.6, color: text ? 'var(--text)' : 'var(--muted)', wordBreak:'break-word' }}>
-                {text || (side==='left' ? 'เสียงที่พูดจะปรากฏที่นี่…' : 'คำแปลจะปรากฏที่นี่…')}
-              </div>
-            </div>
-          ))}
-        </div>
+        <div style={{ fontSize:12, minHeight:16, marginBottom:14, textAlign:'center', color: statusType==='error' ? 'var(--right)' : statusType==='done' ? '#4fff8f' : statusType==='active' ? 'var(--left)' : 'var(--muted)' }}>{status}</div>
 
         {/* Stereo visualizer */}
-        <div style={{ width:'100%', maxWidth:480, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'14px 16px', marginBottom:12 }}>
-          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:12 }}>🎧 เสียงออกหูซ้าย-ขวา (เล่นทีละหู)</div>
-          {[['L', barL, 'var(--left)', 'หูซ้าย'],['R', barR, 'var(--right)', 'หูขวา']].map(([side, val, color, desc]: any) => (
+        <div style={{ width:'100%', maxWidth:480, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'14px 16px', marginBottom:14 }}>
+          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:12 }}>🎧 เสียงออกหู — ตามภาษาปลายทาง</div>
+          {[['L', barL, 'var(--left)', LANG_NAMES[langA]],['R', barR, 'var(--right)', LANG_NAMES[langB]]].map(([side, val, color, desc]: any) => (
             <div key={side} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6 }}>
               <span style={{ fontSize:11, fontWeight:700, width:14, textAlign:'center', color }}>{side}</span>
               <div style={{ flex:1, height:8, background:'var(--border)', borderRadius:4, overflow:'hidden' }}>
                 <div style={{ height:'100%', borderRadius:4, width: val+'%', background:`linear-gradient(90deg,${color},${color}88)`, transition:'width 0.08s ease' }} />
               </div>
-              <span style={{ fontSize:11, color, width:50, textAlign:'right' }}>{desc}</span>
+              <span style={{ fontSize:11, color, width:60, textAlign:'right' }}>{desc}</span>
             </div>
           ))}
         </div>
 
-        {/* Play button */}
-        {ready && (
-          <button onClick={playStereo} disabled={isPlaying}
-            style={{ width:'100%', maxWidth:480, padding:13, borderRadius:12, border:'1px solid var(--border)', background:'linear-gradient(135deg,rgba(79,143,255,0.1),rgba(255,107,107,0.1))', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:13, fontWeight:600, cursor: isPlaying ? 'default' : 'pointer', opacity: isPlaying ? 0.5 : 1, marginBottom:10 }}>
-            {isPlaying ? '⏳ กำลังเล่น…' : '🎧 เล่นเสียง (หูซ้าย = ต้นทาง · หูขวา = แปล)'}
-          </button>
+        {/* Conversation history */}
+        {history.length > 0 && (
+          <div style={{ width:'100%', maxWidth:480, marginBottom:12, display:'flex', flexDirection:'column', gap:8 }}>
+            {history.slice().reverse().map((t, i) => {
+              const color = t.who === 'A' ? 'var(--left)' : 'var(--right)'
+              return (
+                <div key={i} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:12, padding:12 }}>
+                  <div style={{ fontSize:10, fontWeight:600, letterSpacing:1.5, textTransform:'uppercase', color, marginBottom:5 }}>
+                    {t.who} พูด ({LANG_NAMES[t.fromLang] || t.fromLang})
+                  </div>
+                  <div style={{ fontSize:13, color:'var(--text)', marginBottom:6, wordBreak:'break-word' }}>{t.original}</div>
+                  <div style={{ fontSize:10, fontWeight:600, letterSpacing:1.5, textTransform:'uppercase', color:'var(--muted)', marginBottom:5 }}>
+                    แปลถึง {t.who === 'A' ? 'B' : 'A'} ({LANG_NAMES[t.toLang] || t.toLang})
+                  </div>
+                  <div style={{ fontSize:13, color:'var(--text)', wordBreak:'break-word' }}>{t.translated}</div>
+                </div>
+              )
+            })}
+          </div>
         )}
 
         <div style={{ fontSize:11, color:'var(--muted)', textAlign:'center', marginTop:6, lineHeight:1.7 }}>
           Web Speech API (ฟัง) → Gemini 2.5 Flash (แปล) → Web Speech API (พูด)<br/>
-          เล่นทีละหู: ซ้าย = ต้นทาง ขวา = แปล · ใช้เสียงจากระบบ/เบราว์เซอร์ ไม่มีค่าใช้จ่าย
+          A พูด → แปล → พูดออกหู R (ฝั่ง B) · B พูด → แปล → พูดออกหู L (ฝั่ง A)
         </div>
       </div>
     </>
