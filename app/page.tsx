@@ -142,14 +142,14 @@ export default function Home() {
     try { recognitionRef.current?.stop() } catch {}
   }
 
-  // ── Translate (Gemini 2.0 Flash) ────────────────────────────────────────────
+  // ── Translate (Gemini 2.5 Flash) ────────────────────────────────────────────
   async function doTranslate(text: string) {
     showStatus('🔄 กำลังแปลด้วย Gemini…', 'active')
     const srcName = LANG_NAMES[srcLang] || 'English'
     const tgtName = LANG_NAMES[tgtLang] || 'Thai'
     try {
       const resp = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
         {
           method: 'POST',
           headers: {
@@ -386,7 +386,7 @@ export default function Home() {
         )}
 
         <div style={{ fontSize:11, color:'var(--muted)', textAlign:'center', marginTop:6, lineHeight:1.7 }}>
-          Web Speech API (ฟัง) → Gemini 2.0 Flash (แปล) → Web Speech API (พูด)<br/>
+          Web Speech API (ฟัง) → Gemini 2.5 Flash (แปล) → Web Speech API (พูด)<br/>
           เล่นทีละหู: ซ้าย = ต้นทาง ขวา = แปล · ใช้เสียงจากระบบ/เบราว์เซอร์ ไม่มีค่าใช้จ่าย
         </div>
       </div>

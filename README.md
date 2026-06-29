@@ -22,7 +22,9 @@
 ## Tech Stack
 - **Next.js 14** (App Router)
 - **Web Speech API — SpeechRecognition** — รับเสียง (STT)
-- **Google Gemini 2.0 Flash** (ผ่าน AI Studio API key) — แปลภาษา ฟรีและเร็ว
+- **Google Gemini 2.5 Flash** (ผ่าน AI Studio API key) — แปลภาษา ฟรีและเร็ว
+  - หมายเหตุ: `gemini-2.0-flash` ถูก Google ปลดระวางแล้ว (ปิดให้บริการ 1 มิ.ย. 2026)
+    ถ้าเจอ error 429/404 ในอนาคต ให้เช็ครายชื่อโมเดลล่าสุดที่ ai.google.dev/gemini-api/docs/models
 - **Web Speech API — SpeechSynthesis** — อ่านออกเสียง (TTS) ฟรี ทำงานในเบราว์เซอร์ ไม่ต้องมี backend
 - เล่นเสียงทีละหู: ◀ หูซ้าย = ต้นทาง, หูขวา ▶ = แปลแล้ว
   - หมายเหตุ: Web Speech API ไม่ส่งคืน audio buffer ให้ใช้ AudioContext StereoPanner ได้ตรงๆ
