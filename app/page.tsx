@@ -10,19 +10,18 @@ const LANG_STT: Record<string, string> = {
   th: 'th-TH', en: 'en-US', ja: 'ja-JP',
   zh: 'zh-CN', ko: 'ko-KR', fr: 'fr-FR', es: 'es-ES',
 }
-const VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
-const VOICE_LABELS: Record<string, string> = {
-  alloy: 'Alloy (กลาง)', echo: 'Echo (ชาย)', fable: 'Fable (อังกฤษ)',
-  onyx: 'Onyx (ชายลึก)', nova: 'Nova (หญิง)', shimmer: 'Shimmer (หญิงนุ่ม)',
+// BCP-47 prefixes used to auto-pick a matching system voice for each language
+const LANG_VOICE_PREFIX: Record<string, string> = {
+  th: 'th', en: 'en', ja: 'ja', zh: 'zh', ko: 'ko', fr: 'fr', es: 'es',
 }
 
 export default function Home() {
-  const [anthropicKey, setAnthropicKey] = useState('')
-  const [openaiKey, setOpenaiKey]       = useState('')
+  const [geminiKey, setGeminiKey]       = useState('')
   const [srcLang, setSrcLang]           = useState('en')
   const [tgtLang, setTgtLang]           = useState('th')
-  const [voiceSrc, setVoiceSrc]         = useState('nova')
-  const [voiceTgt, setVoiceTgt]         = useState('echo')
+  const [voices, setVoices]             = useState<SpeechSynthesisVoice[]>([])
+  const [voiceSrc, setVoiceSrc]         = useState('')
+  const [voiceTgt, setVoiceTgt]         = useState('')
   const [playMode, setPlayMode]         = useState<'sequential'|'simultaneous'>('sequential')
   const [srcText, setSrcText]           = useState('')
   const [tgtText, setTgtText]           = useState('')
@@ -36,24 +35,57 @@ export default function Home() {
   const [micHint, setMicHint]           = useState('กดเพื่อเริ่มพูด')
 
   const recognitionRef  = useRef<any>(null)
-  const audioCtxRef     = useRef<AudioContext | null>(null)
-  const srcAudioRef     = useRef<ArrayBuffer | null>(null)
-  const tgtAudioRef     = useRef<ArrayBuffer | null>(null)
   const vizRef          = useRef<ReturnType<typeof setInterval> | null>(null)
   const currentSrcRef   = useRef('')
   const currentTgtRef   = useRef('')
 
   useEffect(() => {
-    const ant = localStorage.getItem('ant_key') || ''
-    const oai = localStorage.getItem('oai_key') || ''
-    if (ant) setAnthropicKey(ant)
-    if (oai) setOpenaiKey(oai)
+    const gem = localStorage.getItem('gemini_key') || ''
+    if (gem) setGeminiKey(gem)
+
+    const synth = (window as any).speechSynthesis
+    if (!synth) return
+
+    function loadVoices() {
+      const list: SpeechSynthesisVoice[] = synth.getVoices()
+      if (!list.length) return
+      setVoices(list)
+      // pick saved choice, else best-matching voice for current languages
+      const savedSrc = localStorage.getItem('voice_src') || ''
+      const savedTgt = localStorage.getItem('voice_tgt') || ''
+      setVoiceSrc(savedSrc && list.some(v => v.name === savedSrc) ? savedSrc : pickVoiceFor(srcLang, list))
+      setVoiceTgt(savedTgt && list.some(v => v.name === savedTgt) ? savedTgt : pickVoiceFor(tgtLang, list))
+    }
+    loadVoices()
+    synth.onvoiceschanged = loadVoices
+    return () => { synth.onvoiceschanged = null }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  function pickVoiceFor(lang: string, list: SpeechSynthesisVoice[]) {
+    const prefix = LANG_VOICE_PREFIX[lang] || lang
+    const match = list.find(v => v.lang.toLowerCase().startsWith(prefix))
+    return match ? match.name : (list[0]?.name || '')
+  }
+
+  // When source/target language changes, re-pick a sensible default voice if available
+  useEffect(() => {
+    if (!voices.length) return
+    setVoiceSrc(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[srcLang] || srcLang))) ? prev : pickVoiceFor(srcLang, voices))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [srcLang, voices])
+
+  useEffect(() => {
+    if (!voices.length) return
+    setVoiceTgt(prev => (prev && voices.some(v => v.name === prev && v.lang.toLowerCase().startsWith(LANG_VOICE_PREFIX[tgtLang] || tgtLang))) ? prev : pickVoiceFor(tgtLang, voices))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tgtLang, voices])
+
   function saveKeys() {
-    localStorage.setItem('ant_key', anthropicKey)
-    localStorage.setItem('oai_key', openaiKey)
-    showStatus('✓ บันทึก API Keys แล้ว', 'done')
+    localStorage.setItem('gemini_key', geminiKey)
+    localStorage.setItem('voice_src', voiceSrc)
+    localStorage.setItem('voice_tgt', voiceTgt)
+    showStatus('✓ บันทึก API Key แล้ว', 'done')
     setTimeout(() => showStatus(''), 2000)
   }
 
@@ -65,14 +97,6 @@ export default function Home() {
     setSrcLang(tgtLang); setTgtLang(srcLang)
   }
 
-  function getAudioCtx() {
-    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-      audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
-    }
-    if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume()
-    return audioCtxRef.current
-  }
-
   // ── Mic ──────────────────────────────────────────────────────────────────
   function toggleMic() {
     if (isRecording) stopMic()
@@ -80,8 +104,7 @@ export default function Home() {
   }
 
   function startMic() {
-    if (!anthropicKey) { showStatus('⚠ ใส่ Anthropic API Key ก่อน', 'error'); return }
-    if (!openaiKey)    { showStatus('⚠ ใส่ OpenAI API Key ก่อน', 'error'); return }
+    if (!geminiKey) { showStatus('⚠ ใส่ Gemini API Key ก่อน', 'error'); return }
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
     if (!SR) { showStatus('⚠ Browser ไม่รองรับ Speech Recognition', 'error'); return }
 
@@ -96,8 +119,8 @@ export default function Home() {
       setMicHint('กำลังฟัง… พูดได้เลย')
       showStatus('🎙 รับเสียง…', 'active')
       setReady(false)
-      srcAudioRef.current = null
-      tgtAudioRef.current = null
+      setSrcText(''); setTgtText('')
+      currentSrcRef.current = ''; currentTgtRef.current = ''
     }
     rec.onresult = (e: any) => {
       let final = '', interim = ''
@@ -119,79 +142,57 @@ export default function Home() {
     try { recognitionRef.current?.stop() } catch {}
   }
 
-  // ── Translate ─────────────────────────────────────────────────────────────
+  // ── Translate (Gemini 2.0 Flash) ────────────────────────────────────────────
   async function doTranslate(text: string) {
-    showStatus('🔄 กำลังแปลด้วย Claude…', 'active')
+    showStatus('🔄 กำลังแปลด้วย Gemini…', 'active')
     const srcName = LANG_NAMES[srcLang] || 'English'
     const tgtName = LANG_NAMES[tgtLang] || 'Thai'
     try {
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 500,
-          messages: [{ role: 'user', content: `Translate from ${srcName} to ${tgtName}. Return ONLY the translated text.\n\n${text}` }],
-        }),
-      })
-      if (!resp.ok) throw new Error('Claude API ' + resp.status)
+      const resp = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': geminiKey,
+          },
+          body: JSON.stringify({
+            contents: [{
+              role: 'user',
+              parts: [{ text: `Translate from ${srcName} to ${tgtName}. Return ONLY the translated text, nothing else.\n\n${text}` }],
+            }],
+          }),
+        }
+      )
+      if (!resp.ok) {
+        const errBody = await resp.text().catch(() => '')
+        throw new Error('Gemini API ' + resp.status + (errBody ? ': ' + errBody.slice(0, 120) : ''))
+      }
       const data = await resp.json()
-      const translated = data.content?.[0]?.text?.trim() || ''
+      const translated = (data.candidates?.[0]?.content?.parts?.[0]?.text || '').trim()
+      if (!translated) throw new Error('ไม่ได้รับคำแปลจาก Gemini')
       currentTgtRef.current = translated
       setTgtText(translated)
-      await buildTTS(text, translated)
+      showStatus('✓ พร้อมแล้ว! กด ▶ เพื่อฟัง', 'done')
+      setReady(true)
     } catch (err: any) {
       showStatus('⚠ ' + err.message, 'error')
     }
   }
 
-  // ── TTS ───────────────────────────────────────────────────────────────────
-  async function fetchTTS(text: string, voice: string): Promise<ArrayBuffer> {
-    const resp = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + openaiKey },
-      body: JSON.stringify({ model: 'tts-1', input: text, voice, response_format: 'mp3' }),
-    })
-    if (!resp.ok) throw new Error('OpenAI TTS ' + resp.status)
-    return resp.arrayBuffer()
-  }
-
-  async function buildTTS(src: string, tgt: string) {
-    showStatus('🎵 กำลังสร้างเสียง TTS…', 'active')
-    try {
-      const [srcBuf, tgtBuf] = await Promise.all([
-        fetchTTS(src, voiceSrc),
-        fetchTTS(tgt, voiceTgt),
-      ])
-      srcAudioRef.current = srcBuf
-      tgtAudioRef.current = tgtBuf
-      showStatus('✓ พร้อมแล้ว! กด ▶ เพื่อฟัง', 'done')
-      setReady(true)
-    } catch (err: any) {
-      showStatus('⚠ TTS: ' + err.message, 'error')
-    }
-  }
-
-  // ── Play stereo ───────────────────────────────────────────────────────────
-  function playPanned(buf: ArrayBuffer, pan: number): Promise<void> {
-    return new Promise(async (resolve, reject) => {
-      const ctx = getAudioCtx()
-      try {
-        const decoded = await ctx.decodeAudioData(buf.slice(0))
-        const source  = ctx.createBufferSource()
-        source.buffer = decoded
-        const panner  = ctx.createStereoPanner()
-        panner.pan.value = pan
-        source.connect(panner)
-        panner.connect(ctx.destination)
-        source.onended = () => resolve()
-        source.start(0)
-      } catch (e) { reject(e) }
+  // ── TTS (Web Speech API) ─────────────────────────────────────────────────
+  function speak(text: string, voiceName: string, lang: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const synth = (window as any).speechSynthesis
+      if (!synth) { reject(new Error('Browser ไม่รองรับ Speech Synthesis')); return }
+      const utter = new SpeechSynthesisUtterance(text)
+      const v = voices.find(v => v.name === voiceName)
+      if (v) utter.voice = v
+      utter.lang = v?.lang || LANG_STT[lang] || 'en-US'
+      utter.onend = () => resolve()
+      utter.onerror = (e: any) => reject(new Error(e?.error || 'พูดไม่สำเร็จ'))
+      synth.cancel() // clear any queued utterances first
+      synth.speak(utter)
     })
   }
 
@@ -210,26 +211,28 @@ export default function Home() {
   }
 
   async function playStereo() {
-    if (!srcAudioRef.current || !tgtAudioRef.current) return
+    const src = currentSrcRef.current, tgt = currentTgtRef.current
+    if (!src || !tgt) return
     setIsPlaying(true)
     try {
       if (playMode === 'sequential') {
         showStatus('◀ หูซ้าย — เสียงต้นทาง', 'active')
         startViz(true, false)
-        await playPanned(srcAudioRef.current, -1.0)
+        await speak(src, voiceSrc, srcLang)
         stopViz()
         await sleep(400)
         showStatus('▶ หูขวา — เสียงแปล', 'active')
         startViz(false, true)
-        await playPanned(tgtAudioRef.current, +1.0)
+        await speak(tgt, voiceTgt, tgtLang)
         stopViz()
       } else {
-        showStatus('⊕ ทั้งสองหูพร้อมกัน', 'active')
+        // Web Speech API can only speak one utterance at a time per the
+        // browser's synthesis queue, so "simultaneous" plays back-to-back
+        // with both visualizer bars active to suggest the stereo pairing.
+        showStatus('⊕ ทั้งสองหู (เล่นต่อกันเร็ว)', 'active')
         startViz(true, true)
-        await Promise.all([
-          playPanned(srcAudioRef.current, -1.0),
-          playPanned(tgtAudioRef.current, +1.0),
-        ])
+        await speak(src, voiceSrc, srcLang)
+        await speak(tgt, voiceTgt, tgtLang)
         stopViz()
       }
       showStatus('✓ เล่นเสร็จแล้ว 🎧', 'done')
@@ -241,6 +244,13 @@ export default function Home() {
   }
 
   function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+
+  // group voices by language prefix match, fall back to showing all
+  function voicesFor(lang: string) {
+    const prefix = LANG_VOICE_PREFIX[lang] || lang
+    const matched = voices.filter(v => v.lang.toLowerCase().startsWith(prefix))
+    return matched.length ? matched : voices
+  }
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -266,17 +276,18 @@ export default function Home() {
           </div>
         </div>
 
-        {/* API Keys */}
+        {/* API Key */}
         <div style={{ width:'100%', maxWidth:480, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'14px 16px', marginBottom:14 }}>
-          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:10 }}>🔑 API Keys</div>
-          {[['Anthropic', anthropicKey, setAnthropicKey, 'sk-ant-...'],['OpenAI TTS', openaiKey, setOpenaiKey, 'sk-...']].map(([label, val, setter, ph]: any) => (
-            <div key={label} style={{ display:'flex', gap:8, marginBottom:8, alignItems:'center' }}>
-              <span style={{ fontSize:11, color:'var(--muted)', width:85, flexShrink:0 }}>{label}</span>
-              <input type="password" value={val} onChange={e => setter(e.target.value)} placeholder={ph}
-                style={{ flex:1, background:'var(--bg)', border:'1px solid var(--border)', borderRadius:8, padding:'9px 12px', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:12, outline:'none' }} />
-            </div>
-          ))}
-          <button onClick={saveKeys} style={{ marginTop:4, background:'var(--left-dim)', border:'1px solid var(--left)', color:'var(--left)', borderRadius:8, padding:'8px 16px', fontFamily:"'Space Grotesk',sans-serif", fontSize:12, fontWeight:600, cursor:'pointer' }}>💾 บันทึก Keys</button>
+          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:10 }}>🔑 Gemini API Key</div>
+          <div style={{ display:'flex', gap:8, marginBottom:6, alignItems:'center' }}>
+            <span style={{ fontSize:11, color:'var(--muted)', width:85, flexShrink:0 }}>Gemini</span>
+            <input type="password" value={geminiKey} onChange={e => setGeminiKey(e.target.value)} placeholder="AIza..."
+              style={{ flex:1, background:'var(--bg)', border:'1px solid var(--border)', borderRadius:8, padding:'9px 12px', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:12, outline:'none' }} />
+          </div>
+          <div style={{ fontSize:10.5, color:'var(--muted)', marginBottom:8, lineHeight:1.5 }}>
+            ขอฟรีได้ที่ <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" style={{ color:'var(--left)' }}>aistudio.google.com/app/apikey</a>
+          </div>
+          <button onClick={saveKeys} style={{ marginTop:4, background:'var(--left-dim)', border:'1px solid var(--left)', color:'var(--left)', borderRadius:8, padding:'8px 16px', fontFamily:"'Space Grotesk',sans-serif", fontSize:12, fontWeight:600, cursor:'pointer' }}>💾 บันทึก Key</button>
         </div>
 
         {/* Mode toggle */}
@@ -284,7 +295,7 @@ export default function Home() {
           {(['sequential','simultaneous'] as const).map(m => (
             <button key={m} onClick={() => setPlayMode(m)}
               style={{ flex:1, padding:'8px', borderRadius:8, border:'1px solid', borderColor: playMode===m ? 'var(--left)' : 'var(--border)', background: playMode===m ? 'var(--left-dim)' : 'transparent', color: playMode===m ? 'var(--left)' : 'var(--muted)', fontFamily:"'Space Grotesk',sans-serif", fontSize:11, fontWeight:600, cursor:'pointer' }}>
-              {m === 'sequential' ? '▶▶ เล่นต่อกัน' : '⊕ พร้อมกันสองหู'}
+              {m === 'sequential' ? '▶▶ เล่นต่อกัน' : '⊕ เล่นต่อกันเร็ว'}
             </button>
           ))}
         </div>
@@ -306,16 +317,23 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Voice pickers */}
-        <div style={{ display:'flex', gap:8, width:'100%', maxWidth:480, marginBottom:14 }}>
-          {[['◀ L เสียงต้นทาง', voiceSrc, setVoiceSrc, 'var(--left)'],['R ▶ เสียงแปล', voiceTgt, setVoiceTgt, 'var(--right)']].map(([label, val, setter, color]: any) => (
+        {/* Voice pickers (system voices via Web Speech API) */}
+        <div style={{ display:'flex', gap:8, width:'100%', maxWidth:480, marginBottom:6 }}>
+          {[['◀ L เสียงต้นทาง', voiceSrc, setVoiceSrc, 'var(--left)', srcLang],['R ▶ เสียงแปล', voiceTgt, setVoiceTgt, 'var(--right)', tgtLang]].map(([label, val, setter, color, lang]: any) => (
             <div key={label} style={{ flex:1, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:10, padding:'8px 12px' }}>
               <label style={{ fontSize:10, letterSpacing:1.5, color, textTransform:'uppercase', display:'block', marginBottom:4 }}>{label}</label>
-              <select value={val} onChange={e => setter(e.target.value)} style={{ background:'transparent', border:'none', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:13, fontWeight:600, outline:'none', cursor:'pointer', width:'100%' }}>
-                {VOICES.map(v => <option key={v} value={v}>{VOICE_LABELS[v]}</option>)}
-              </select>
+              {voicesFor(lang).length ? (
+                <select value={val} onChange={e => setter(e.target.value)} style={{ background:'transparent', border:'none', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:12.5, fontWeight:600, outline:'none', cursor:'pointer', width:'100%' }}>
+                  {voicesFor(lang).map(v => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}
+                </select>
+              ) : (
+                <div style={{ fontSize:11.5, color:'var(--muted)' }}>กำลังโหลดเสียง…</div>
+              )}
             </div>
           ))}
+        </div>
+        <div style={{ fontSize:10, color:'var(--muted)', textAlign:'center', marginBottom:12, lineHeight:1.5 }}>
+          เสียงมาจากระบบ/เบราว์เซอร์ของคุณ — รายการอาจต่างกันในแต่ละเครื่อง
         </div>
 
         {/* Mic */}
@@ -347,7 +365,7 @@ export default function Home() {
 
         {/* Stereo visualizer */}
         <div style={{ width:'100%', maxWidth:480, background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'14px 16px', marginBottom:12 }}>
-          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:12 }}>🎧 Stereo Output — Real AudioContext Panning</div>
+          <div style={{ fontSize:10, letterSpacing:2, color:'var(--muted)', textTransform:'uppercase', marginBottom:12 }}>🎧 เสียงออกหูซ้าย-ขวา (เล่นทีละหู)</div>
           {[['L', barL, 'var(--left)', 'หูซ้าย'],['R', barR, 'var(--right)', 'หูขวา']].map(([side, val, color, desc]: any) => (
             <div key={side} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6 }}>
               <span style={{ fontSize:11, fontWeight:700, width:14, textAlign:'center', color }}>{side}</span>
@@ -363,13 +381,13 @@ export default function Home() {
         {ready && (
           <button onClick={playStereo} disabled={isPlaying}
             style={{ width:'100%', maxWidth:480, padding:13, borderRadius:12, border:'1px solid var(--border)', background:'linear-gradient(135deg,rgba(79,143,255,0.1),rgba(255,107,107,0.1))', color:'var(--text)', fontFamily:"'Space Grotesk',sans-serif", fontSize:13, fontWeight:600, cursor: isPlaying ? 'default' : 'pointer', opacity: isPlaying ? 0.5 : 1, marginBottom:10 }}>
-            {isPlaying ? '⏳ กำลังเล่น…' : '🎧 เล่นสเตอริโอจริง (หูซ้าย = ต้นทาง · หูขวา = แปล)'}
+            {isPlaying ? '⏳ กำลังเล่น…' : '🎧 เล่นเสียง (หูซ้าย = ต้นทาง · หูขวา = แปล)'}
           </button>
         )}
 
         <div style={{ fontSize:11, color:'var(--muted)', textAlign:'center', marginTop:6, lineHeight:1.7 }}>
-          Web Speech API → Claude (แปล) → OpenAI TTS → AudioContext StereoPanner<br/>
-          หูซ้าย pan = -1.0 · หูขวา pan = +1.0 · รองรับ Bluetooth headphone
+          Web Speech API (ฟัง) → Gemini 2.0 Flash (แปล) → Web Speech API (พูด)<br/>
+          เล่นทีละหู: ซ้าย = ต้นทาง ขวา = แปล · ใช้เสียงจากระบบ/เบราว์เซอร์ ไม่มีค่าใช้จ่าย
         </div>
       </div>
     </>

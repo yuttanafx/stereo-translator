@@ -15,16 +15,16 @@
 3. ไปที่ vercel.com/new → Import GitHub repo → Deploy
 
 ## ใช้งาน
-1. ใส่ **Anthropic API Key** (claude.ai → API Keys)
-2. ใส่ **OpenAI API Key** (platform.openai.com → API Keys)
-3. เลือกภาษา + เสียงแต่ละหู
-4. กดไมค์ → พูด → รอ → กด ▶
+1. ใส่ **Gemini API Key** (ขอฟรีที่ aistudio.google.com/app/apikey)
+2. เลือกภาษา + เสียงแต่ละหู (เสียงจะดึงจากระบบ/เบราว์เซอร์ของคุณอัตโนมัติ)
+3. กดไมค์ → พูด → รอ → กด ▶
 
 ## Tech Stack
 - **Next.js 14** (App Router)
-- **Web Speech API** — รับเสียง (STT)
-- **Claude claude-sonnet-4-6** — แปลภาษา
-- **OpenAI TTS** — สร้างเสียง
-- **AudioContext StereoPanner** — แยกหูซ้าย/ขวาจริง
-  - หูซ้าย pan = -1.0 (ต้นทาง)
-  - หูขวา pan = +1.0 (แปลแล้ว)
+- **Web Speech API — SpeechRecognition** — รับเสียง (STT)
+- **Google Gemini 2.0 Flash** (ผ่าน AI Studio API key) — แปลภาษา ฟรีและเร็ว
+- **Web Speech API — SpeechSynthesis** — อ่านออกเสียง (TTS) ฟรี ทำงานในเบราว์เซอร์ ไม่ต้องมี backend
+- เล่นเสียงทีละหู: ◀ หูซ้าย = ต้นทาง, หูขวา ▶ = แปลแล้ว
+  - หมายเหตุ: Web Speech API ไม่ส่งคืน audio buffer ให้ใช้ AudioContext StereoPanner ได้ตรงๆ
+    เหมือน MP3 ของ TTS API ทั่วไป ดังนั้นแอปนี้จึง "เล่นสลับหู" ทีละข้างแทนการ pan
+    สัญญาณเสียงเดียวพร้อมกันสองหูจริง
