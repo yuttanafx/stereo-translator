@@ -124,7 +124,10 @@ export default function Home() {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) final += e.results[i][0].transcript
       }
-      if (final) handleFinalTranscript(who, final.trim())
+      if (final) {
+        try { rec.stop() } catch {} // stop immediately, don't wait for the engine's own auto-stop
+        handleFinalTranscript(who, final.trim())
+      }
     }
     rec.onerror = (e: any) => {
       if (e.error === 'no-speech' || e.error === 'aborted') { resetIdle(); return }
@@ -176,6 +179,11 @@ export default function Home() {
               role: 'user',
               parts: [{ text: `Translate from ${fromName} to ${toName}. Return ONLY the translated text, nothing else.\n\n${text}` }],
             }],
+            generationConfig: {
+              thinkingConfig: { thinkingBudget: 0 }, // translation needs no reasoning step — this is the main latency win
+              maxOutputTokens: 512,
+              temperature: 0.3,
+            },
           }),
         }
       )
